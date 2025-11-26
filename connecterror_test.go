@@ -3,7 +3,7 @@ package connecterror_test
 import (
 	"testing"
 
-	"connecterror"
+	"github.com/YusukeMigitera/connecterror"
 
 	"github.com/gostaticanalysis/testutil"
 	"golang.org/x/tools/go/analysis/analysistest"

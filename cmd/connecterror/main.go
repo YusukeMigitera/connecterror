@@ -1,7 +1,7 @@
 package main
 
 import (
-	"connecterror"
+	"github.com/YusukeMigitera/connecterror"
 
 	"golang.org/x/tools/go/analysis/unitchecker"
 )

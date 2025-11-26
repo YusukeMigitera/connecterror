@@ -1,4 +1,4 @@
-module connecterror
+module github.com/YusukeMigitera/connecterror
 
 go 1.25.4
 
