@@ -37,6 +37,11 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 
 		ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
+			// Returns inside closures do not belong to the handler.
+			if _, ok := n.(*ast.FuncLit); ok {
+				return false
+			}
+
 			returnStmt, ok := n.(*ast.ReturnStmt)
 			if !ok {
 				return true

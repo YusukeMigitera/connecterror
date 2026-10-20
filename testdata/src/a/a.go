@@ -31,6 +31,19 @@ func (s *Server) goodMethodWithHelper(
 	return nil, helper()
 }
 
+func (s *Server) goodMethodWithClosure(
+	ctx context.Context,
+	req *connect.Request[Request],
+) (*connect.Response[Response], error) {
+	f := func() (*Response, error) {
+		return nil, err
+	}
+	if _, err := f(); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	return nil, connect.NewError(connect.CodeInternal, err)
+}
+
 func (s *Server) badMethod(
 	ctx context.Context,
 	req *connect.Request[Request],
