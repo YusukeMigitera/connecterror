@@ -32,7 +32,7 @@ func run(pass *analysis.Pass) (any, error) {
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
 		funcDecl := n.(*ast.FuncDecl)
 
-		if !hasConnectResponseReturn(funcDecl) {
+		if !hasConnectResponseReturn(pass, funcDecl) {
 			return
 		}
 
@@ -76,38 +76,30 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-func hasConnectResponseReturn(funcDecl *ast.FuncDecl) bool {
-	if funcDecl.Type.Results == nil {
+// hasConnectResponseReturn reports whether funcDecl has a Connect handler
+// signature: the first result is *connect.Response[T] and the last is error.
+func hasConnectResponseReturn(pass *analysis.Pass, funcDecl *ast.FuncDecl) bool {
+	obj := pass.TypesInfo.Defs[funcDecl.Name]
+	if obj == nil {
 		return false
 	}
 
-	for _, result := range funcDecl.Type.Results.List {
-		starExpr, ok := result.Type.(*ast.StarExpr)
-		if !ok {
-			continue
-		}
-
-		indexExpr, ok := starExpr.X.(*ast.IndexExpr)
-		if !ok {
-			continue
-		}
-
-		selectorExpr, ok := indexExpr.X.(*ast.SelectorExpr)
-		if !ok {
-			continue
-		}
-
-		pkg, ok := selectorExpr.X.(*ast.Ident)
-		if !ok {
-			continue
-		}
-
-		if pkg.Name == "connect" && selectorExpr.Sel.Name == "Response" {
-			return true
-		}
+	sig, ok := obj.Type().(*types.Signature)
+	if !ok {
+		return false
 	}
 
-	return false
+	results := sig.Results()
+	if results.Len() < 2 {
+		return false
+	}
+
+	if !isConnectPointer(results.At(0).Type(), "Response") {
+		return false
+	}
+
+	errorType := types.Universe.Lookup("error").Type()
+	return types.Identical(results.At(results.Len()-1).Type(), errorType)
 }
 
 func isNilOrConnectError(pass *analysis.Pass, expr ast.Expr) bool {
@@ -120,12 +112,18 @@ func isNilOrConnectError(pass *analysis.Pass, expr ast.Expr) bool {
 		return false
 	}
 
+	return isConnectPointer(typ, "Error")
+}
+
+// isConnectPointer reports whether typ is a pointer to the named type
+// in connectrpc.com/connect.
+func isConnectPointer(typ types.Type, name string) bool {
 	ptr, ok := typ.Underlying().(*types.Pointer)
 	if !ok {
 		return false
 	}
 
-	named, ok := ptr.Elem().(*types.Named)
+	named, ok := types.Unalias(ptr.Elem()).(*types.Named)
 	if !ok {
 		return false
 	}
@@ -137,5 +135,5 @@ func isNilOrConnectError(pass *analysis.Pass, expr ast.Expr) bool {
 
 	pkgPath := obj.Pkg().Path()
 	return (strings.HasSuffix(pkgPath, "connectrpc.com/connect")) &&
-		obj.Name() == "Error"
+		obj.Name() == name
 }
