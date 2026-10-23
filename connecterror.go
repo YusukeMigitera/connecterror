@@ -2,12 +2,14 @@ package connecterror
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/types"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
+	"golang.org/x/tools/go/types/typeutil"
 )
 
 const doc = "connect_error is ..."
@@ -107,12 +109,99 @@ func isNilOrConnectError(pass *analysis.Pass, expr ast.Expr) bool {
 		return true
 	}
 
+	return isConnectError(pass, expr)
+}
+
+// isConnectError reports whether expr is a *connect.Error, or an error that
+// wraps one with fmt.Errorf's %w verb so that errors.As can still find it.
+func isConnectError(pass *analysis.Pass, expr ast.Expr) bool {
 	typ := pass.TypesInfo.TypeOf(expr)
 	if typ == nil {
 		return false
 	}
 
-	return isConnectPointer(typ, "Error")
+	if isConnectPointer(typ, "Error") {
+		return true
+	}
+
+	call, ok := ast.Unparen(expr).(*ast.CallExpr)
+	if !ok || !isFmtErrorf(pass, call) || len(call.Args) == 0 {
+		return false
+	}
+
+	format := pass.TypesInfo.Types[call.Args[0]].Value
+	if format == nil || format.Kind() != constant.String {
+		return false
+	}
+
+	wrapped, ok := wrappedArgIndexes(constant.StringVal(format))
+	if !ok {
+		return false
+	}
+
+	args := call.Args[1:]
+	for _, i := range wrapped {
+		if i < len(args) && isConnectError(pass, args[i]) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isFmtErrorf(pass *analysis.Pass, call *ast.CallExpr) bool {
+	fn, ok := typeutil.Callee(pass.TypesInfo, call).(*types.Func)
+	if !ok || fn.Pkg() == nil {
+		return false
+	}
+
+	return fn.Pkg().Path() == "fmt" && fn.Name() == "Errorf"
+}
+
+// wrappedArgIndexes returns the indexes of the arguments that format consumes
+// with the %w verb. It reports false for formats it cannot follow, such as
+// explicit argument indexes like %[1]w.
+func wrappedArgIndexes(format string) ([]int, bool) {
+	var wrapped []int
+	arg := 0
+
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			continue
+		}
+		i++
+
+		// flags
+		for i < len(format) && strings.IndexByte("+-# 0", format[i]) >= 0 {
+			i++
+		}
+
+		// width and precision; '*' consumes an argument
+		for i < len(format) && (format[i] == '*' || format[i] == '.' || ('0' <= format[i] && format[i] <= '9')) {
+			if format[i] == '*' {
+				arg++
+			}
+			i++
+		}
+
+		if i >= len(format) {
+			break
+		}
+
+		switch format[i] {
+		case '%':
+			// literal percent; no argument
+		case '[':
+			return nil, false
+		case 'w':
+			wrapped = append(wrapped, arg)
+			arg++
+		default:
+			arg++
+		}
+	}
+
+	return wrapped, true
 }
 
 // isConnectPointer reports whether typ is a pointer to the named type
