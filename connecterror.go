@@ -3,6 +3,7 @@ package connecterror
 import (
 	"go/ast"
 	"go/constant"
+	"go/token"
 	"go/types"
 	"strings"
 
@@ -34,9 +35,11 @@ func run(pass *analysis.Pass) (any, error) {
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
 		funcDecl := n.(*ast.FuncDecl)
 
-		if !hasConnectResponseReturn(pass, funcDecl) {
+		if funcDecl.Body == nil || !hasConnectResponseReturn(pass, funcDecl) {
 			return
 		}
+
+		c := newChecker(pass, funcDecl.Body)
 
 		ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
 			// Returns inside closures do not belong to the handler.
@@ -65,7 +68,7 @@ func run(pass *analysis.Pass) (any, error) {
 				return true
 			}
 
-			if isNilOrConnectError(pass, secondResult) {
+			if c.isNilOrConnectError(secondResult) {
 				return true
 			}
 
@@ -104,18 +107,108 @@ func hasConnectResponseReturn(pass *analysis.Pass, funcDecl *ast.FuncDecl) bool 
 	return types.Identical(results.At(results.Len()-1).Type(), errorType)
 }
 
-func isNilOrConnectError(pass *analysis.Pass, expr ast.Expr) bool {
+// checker decides whether the error returned by a handler is a Connect error.
+// It follows local error variables through the values assigned to them in
+// the handler body.
+type checker struct {
+	pass *analysis.Pass
+	body *ast.BlockStmt
+
+	// assigns holds the values assigned to each local variable.
+	assigns map[*types.Var][]ast.Expr
+	// untracked holds variables whose values cannot be followed, such as
+	// those whose address is taken or that are assigned from a multi-value
+	// expression.
+	untracked map[*types.Var]bool
+	// visiting guards against cycles like `e = fmt.Errorf("%w", e)`.
+	visiting map[*types.Var]bool
+}
+
+func newChecker(pass *analysis.Pass, body *ast.BlockStmt) *checker {
+	c := &checker{
+		pass:      pass,
+		body:      body,
+		assigns:   map[*types.Var][]ast.Expr{},
+		untracked: map[*types.Var]bool{},
+		visiting:  map[*types.Var]bool{},
+	}
+
+	// Closures are included: they can assign to the handler's variables.
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			for i, lhs := range n.Lhs {
+				v := c.localVar(lhs)
+				if v == nil {
+					continue
+				}
+				if len(n.Lhs) == len(n.Rhs) {
+					c.assigns[v] = append(c.assigns[v], n.Rhs[i])
+				} else {
+					c.untracked[v] = true
+				}
+			}
+		case *ast.ValueSpec:
+			for i, name := range n.Names {
+				v := c.localVar(name)
+				if v == nil {
+					continue
+				}
+				if len(n.Names) == len(n.Values) {
+					c.assigns[v] = append(c.assigns[v], n.Values[i])
+				} else if len(n.Values) > 0 {
+					c.untracked[v] = true
+				}
+			}
+		case *ast.RangeStmt:
+			for _, x := range []ast.Expr{n.Key, n.Value} {
+				if v := c.localVar(x); v != nil {
+					c.untracked[v] = true
+				}
+			}
+		case *ast.UnaryExpr:
+			if n.Op == token.AND {
+				if v := c.localVar(n.X); v != nil {
+					c.untracked[v] = true
+				}
+			}
+		}
+		return true
+	})
+
+	return c
+}
+
+// localVar returns the variable that expr names if it is declared in the
+// handler body. Parameters, results and package-level variables are excluded
+// because their values come from outside the body.
+func (c *checker) localVar(expr ast.Expr) *types.Var {
+	ident, ok := ast.Unparen(expr).(*ast.Ident)
+	if !ok {
+		return nil
+	}
+
+	v, ok := c.pass.TypesInfo.ObjectOf(ident).(*types.Var)
+	if !ok || v.Pos() < c.body.Pos() || c.body.End() <= v.Pos() {
+		return nil
+	}
+
+	return v
+}
+
+func (c *checker) isNilOrConnectError(expr ast.Expr) bool {
 	if ident, ok := expr.(*ast.Ident); ok && ident.Name == "nil" {
 		return true
 	}
 
-	return isConnectError(pass, expr)
+	return c.isConnectError(expr)
 }
 
-// isConnectError reports whether expr is a *connect.Error, or an error that
-// wraps one with fmt.Errorf's %w verb so that errors.As can still find it.
-func isConnectError(pass *analysis.Pass, expr ast.Expr) bool {
-	typ := pass.TypesInfo.TypeOf(expr)
+// isConnectError reports whether expr is a *connect.Error, an error that
+// wraps one with fmt.Errorf's %w verb so that errors.As can still find it,
+// or a local variable that is only ever assigned such errors.
+func (c *checker) isConnectError(expr ast.Expr) bool {
+	typ := c.pass.TypesInfo.TypeOf(expr)
 	if typ == nil {
 		return false
 	}
@@ -124,12 +217,16 @@ func isConnectError(pass *analysis.Pass, expr ast.Expr) bool {
 		return true
 	}
 
+	if v := c.localVar(expr); v != nil {
+		return c.isConnectErrorVar(v)
+	}
+
 	call, ok := ast.Unparen(expr).(*ast.CallExpr)
-	if !ok || !isFmtErrorf(pass, call) || len(call.Args) == 0 {
+	if !ok || !isFmtErrorf(c.pass, call) || len(call.Args) == 0 {
 		return false
 	}
 
-	format := pass.TypesInfo.Types[call.Args[0]].Value
+	format := c.pass.TypesInfo.Types[call.Args[0]].Value
 	if format == nil || format.Kind() != constant.String {
 		return false
 	}
@@ -141,12 +238,35 @@ func isConnectError(pass *analysis.Pass, expr ast.Expr) bool {
 
 	args := call.Args[1:]
 	for _, i := range wrapped {
-		if i < len(args) && isConnectError(pass, args[i]) {
+		if i < len(args) && c.isConnectError(args[i]) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func (c *checker) isConnectErrorVar(v *types.Var) bool {
+	values := c.assigns[v]
+	if c.untracked[v] || len(values) == 0 {
+		return false
+	}
+
+	// Assume a variable already being checked holds a Connect error;
+	// its other assignments decide the result.
+	if c.visiting[v] {
+		return true
+	}
+	c.visiting[v] = true
+	defer delete(c.visiting, v)
+
+	for _, value := range values {
+		if !c.isNilOrConnectError(value) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func isFmtErrorf(pass *analysis.Pass, call *ast.CallExpr) bool {
