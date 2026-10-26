@@ -23,7 +23,19 @@ var Analyzer = &analysis.Analyzer{
 	Requires: []*analysis.Analyzer{
 		inspect.Analyzer,
 	},
+	FactTypes: []analysis.Fact{
+		new(returnsConnectError),
+	},
 }
+
+// returnsConnectError is a fact on functions whose last result, of type
+// error, is always nil or a Connect error. It lets handlers in other
+// packages return the errors of such helpers.
+type returnsConnectError struct{}
+
+func (*returnsConnectError) AFact() {}
+
+func (*returnsConnectError) String() string { return "returnsConnectError" }
 
 func run(pass *analysis.Pass) (any, error) {
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
@@ -32,14 +44,49 @@ func run(pass *analysis.Pass) (any, error) {
 		(*ast.FuncDecl)(nil),
 	}
 
+	var handlers []*ast.FuncDecl
+	helpers := map[*types.Func]*checker{}
+	connectFuncs := map[*types.Func]bool{}
+
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
 		funcDecl := n.(*ast.FuncDecl)
-
-		if funcDecl.Body == nil || !hasConnectResponseReturn(pass, funcDecl) {
+		if funcDecl.Body == nil {
 			return
 		}
 
-		c := newChecker(pass, funcDecl.Body)
+		fn, ok := pass.TypesInfo.Defs[funcDecl.Name].(*types.Func)
+		if !ok {
+			return
+		}
+
+		switch {
+		case hasConnectResponseReturn(fn):
+			handlers = append(handlers, funcDecl)
+		case returnsError(fn):
+			helpers[fn] = newChecker(pass, funcDecl.Body, connectFuncs)
+			connectFuncs[fn] = true
+		}
+	})
+
+	// Assume every helper returns Connect errors, then drop the ones that
+	// do not until nothing changes. This decides helpers that call each
+	// other regardless of declaration order, including recursive ones.
+	for changed := true; changed; {
+		changed = false
+		for fn, c := range helpers {
+			if connectFuncs[fn] && !c.returnsOnlyConnectErrors(fn.Signature().Results().Len()) {
+				delete(connectFuncs, fn)
+				changed = true
+			}
+		}
+	}
+
+	for fn := range connectFuncs {
+		pass.ExportObjectFact(fn, new(returnsConnectError))
+	}
+
+	for _, funcDecl := range handlers {
+		c := newChecker(pass, funcDecl.Body, connectFuncs)
 
 		ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
 			// Returns inside closures do not belong to the handler.
@@ -76,30 +123,26 @@ func run(pass *analysis.Pass) (any, error) {
 
 			return true
 		})
-	})
+	}
 
 	return nil, nil
 }
 
-// hasConnectResponseReturn reports whether funcDecl has a Connect handler
+// hasConnectResponseReturn reports whether fn has a Connect handler
 // signature: the first result is *connect.Response[T] and the last is error.
-func hasConnectResponseReturn(pass *analysis.Pass, funcDecl *ast.FuncDecl) bool {
-	obj := pass.TypesInfo.Defs[funcDecl.Name]
-	if obj == nil {
-		return false
-	}
-
-	sig, ok := obj.Type().(*types.Signature)
-	if !ok {
-		return false
-	}
-
-	results := sig.Results()
+func hasConnectResponseReturn(fn *types.Func) bool {
+	results := fn.Signature().Results()
 	if results.Len() < 2 {
 		return false
 	}
 
-	if !isConnectPointer(results.At(0).Type(), "Response") {
+	return isConnectPointer(results.At(0).Type(), "Response") && returnsError(fn)
+}
+
+// returnsError reports whether the last result of fn is error.
+func returnsError(fn *types.Func) bool {
+	results := fn.Signature().Results()
+	if results.Len() == 0 {
 		return false
 	}
 
@@ -107,12 +150,17 @@ func hasConnectResponseReturn(pass *analysis.Pass, funcDecl *ast.FuncDecl) bool 
 	return types.Identical(results.At(results.Len()-1).Type(), errorType)
 }
 
-// checker decides whether the error returned by a handler is a Connect error.
-// It follows local error variables through the values assigned to them in
-// the handler body.
+// checker decides whether the error returned by a function is a Connect
+// error. It follows local error variables through the values assigned to
+// them in the function body, and calls to functions known to return
+// Connect errors.
 type checker struct {
 	pass *analysis.Pass
 	body *ast.BlockStmt
+
+	// connectFuncs holds the functions in this package that return Connect
+	// errors. Functions in other packages are looked up by their facts.
+	connectFuncs map[*types.Func]bool
 
 	// assigns holds the values assigned to each local variable.
 	assigns map[*types.Var][]ast.Expr
@@ -124,13 +172,14 @@ type checker struct {
 	visiting map[*types.Var]bool
 }
 
-func newChecker(pass *analysis.Pass, body *ast.BlockStmt) *checker {
+func newChecker(pass *analysis.Pass, body *ast.BlockStmt, connectFuncs map[*types.Func]bool) *checker {
 	c := &checker{
-		pass:      pass,
-		body:      body,
-		assigns:   map[*types.Var][]ast.Expr{},
-		untracked: map[*types.Var]bool{},
-		visiting:  map[*types.Var]bool{},
+		pass:         pass,
+		body:         body,
+		connectFuncs: connectFuncs,
+		assigns:      map[*types.Var][]ast.Expr{},
+		untracked:    map[*types.Var]bool{},
+		visiting:     map[*types.Var]bool{},
 	}
 
 	// Closures are included: they can assign to the handler's variables.
@@ -142,9 +191,12 @@ func newChecker(pass *analysis.Pass, body *ast.BlockStmt) *checker {
 				if v == nil {
 					continue
 				}
-				if len(n.Lhs) == len(n.Rhs) {
+				switch {
+				case len(n.Lhs) == len(n.Rhs):
 					c.assigns[v] = append(c.assigns[v], n.Rhs[i])
-				} else {
+				case isLastResultOfCall(n.Lhs, n.Rhs, i):
+					c.assigns[v] = append(c.assigns[v], n.Rhs[0])
+				default:
 					c.untracked[v] = true
 				}
 			}
@@ -154,9 +206,14 @@ func newChecker(pass *analysis.Pass, body *ast.BlockStmt) *checker {
 				if v == nil {
 					continue
 				}
-				if len(n.Names) == len(n.Values) {
+				switch {
+				case len(n.Names) == len(n.Values):
 					c.assigns[v] = append(c.assigns[v], n.Values[i])
-				} else if len(n.Values) > 0 {
+				case len(n.Values) == 0:
+					// zero value
+				case isLastResultOfCall(identExprs(n.Names), n.Values, i):
+					c.assigns[v] = append(c.assigns[v], n.Values[0])
+				default:
 					c.untracked[v] = true
 				}
 			}
@@ -179,8 +236,65 @@ func newChecker(pass *analysis.Pass, body *ast.BlockStmt) *checker {
 	return c
 }
 
+// isLastResultOfCall reports whether lhs[i] receives the last result of a
+// multi-value call, as e does in `x, e := f()`. Such a variable holds a
+// Connect error when f is known to return one.
+func isLastResultOfCall(lhs, rhs []ast.Expr, i int) bool {
+	if len(rhs) != 1 || i != len(lhs)-1 {
+		return false
+	}
+
+	_, ok := ast.Unparen(rhs[0]).(*ast.CallExpr)
+	return ok
+}
+
+func identExprs(idents []*ast.Ident) []ast.Expr {
+	exprs := make([]ast.Expr, len(idents))
+	for i, ident := range idents {
+		exprs[i] = ident
+	}
+	return exprs
+}
+
+// returnsOnlyConnectErrors reports whether every return statement in the
+// body, outside closures, returns nil or a Connect error as its last result.
+// numResults is the number of results the function declares.
+func (c *checker) returnsOnlyConnectErrors(numResults int) bool {
+	ok := true
+
+	ast.Inspect(c.body, func(n ast.Node) bool {
+		if !ok {
+			return false
+		}
+
+		if _, isLit := n.(*ast.FuncLit); isLit {
+			return false
+		}
+
+		ret, isRet := n.(*ast.ReturnStmt)
+		if !isRet {
+			return true
+		}
+
+		switch len(ret.Results) {
+		case numResults:
+			ok = c.isNilOrConnectError(ret.Results[numResults-1])
+		case 1:
+			// return f(), where f returns as many results
+			ok = c.isConnectError(ret.Results[0])
+		default:
+			// e.g. a bare return with named results
+			ok = false
+		}
+
+		return false
+	})
+
+	return ok
+}
+
 // localVar returns the variable that expr names if it is declared in the
-// handler body. Parameters, results and package-level variables are excluded
+// function body. Parameters, results and package-level variables are excluded
 // because their values come from outside the body.
 func (c *checker) localVar(expr ast.Expr) *types.Var {
 	ident, ok := ast.Unparen(expr).(*ast.Ident)
@@ -206,7 +320,8 @@ func (c *checker) isNilOrConnectError(expr ast.Expr) bool {
 
 // isConnectError reports whether expr is a *connect.Error, an error that
 // wraps one with fmt.Errorf's %w verb so that errors.As can still find it,
-// or a local variable that is only ever assigned such errors.
+// a call to a function known to return Connect errors, or a local variable
+// that is only ever assigned such errors.
 func (c *checker) isConnectError(expr ast.Expr) bool {
 	typ := c.pass.TypesInfo.TypeOf(expr)
 	if typ == nil {
@@ -222,7 +337,33 @@ func (c *checker) isConnectError(expr ast.Expr) bool {
 	}
 
 	call, ok := ast.Unparen(expr).(*ast.CallExpr)
-	if !ok || !isFmtErrorf(c.pass, call) || len(call.Args) == 0 {
+	if !ok {
+		return false
+	}
+
+	if isFmtErrorf(c.pass, call) {
+		return c.wrapsConnectError(call)
+	}
+
+	// Calls through interfaces and function values are not followed.
+	fn := typeutil.StaticCallee(c.pass.TypesInfo, call)
+	return fn != nil && c.returnsConnectError(fn)
+}
+
+// returnsConnectError reports whether fn is known to return Connect errors.
+func (c *checker) returnsConnectError(fn *types.Func) bool {
+	fn = fn.Origin()
+	if c.connectFuncs[fn] {
+		return true
+	}
+
+	return c.pass.ImportObjectFact(fn, new(returnsConnectError))
+}
+
+// wrapsConnectError reports whether call, a call to fmt.Errorf, wraps a
+// Connect error with the %w verb.
+func (c *checker) wrapsConnectError(call *ast.CallExpr) bool {
+	if len(call.Args) == 0 {
 		return false
 	}
 
