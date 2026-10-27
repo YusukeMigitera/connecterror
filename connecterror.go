@@ -13,11 +13,24 @@ import (
 	"golang.org/x/tools/go/types/typeutil"
 )
 
-const doc = "connect_error is ..."
+const doc = `report Connect handlers that return errors other than *connect.Error
 
-// Analyzer is ...
+A Connect handler is a function whose first result is *connect.Response[T]
+and whose last result is error. Errors other than *connect.Error reach the
+client as CodeUnknown, so a handler that returns nil for the response
+should return a *connect.Error.
+
+The error is accepted if it is
+  - nil or a *connect.Error,
+  - a *connect.Error wrapped with fmt.Errorf's %w verb,
+  - a local variable that is only ever assigned such errors, or
+  - the result of a function, possibly in another package, that only
+    returns such errors.`
+
+// Analyzer reports Connect handlers that return errors other than
+// *connect.Error.
 var Analyzer = &analysis.Analyzer{
-	Name: "connect_error",
+	Name: "connecterror",
 	Doc:  doc,
 	Run:  run,
 	Requires: []*analysis.Analyzer{
