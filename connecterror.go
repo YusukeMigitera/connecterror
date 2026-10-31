@@ -18,14 +18,15 @@ const doc = `report Connect handlers that return errors other than *connect.Erro
 A Connect handler is a function whose first result is *connect.Response[T]
 and whose last result is error. Errors other than *connect.Error reach the
 client as CodeUnknown, so a handler that returns nil for the response
-should return a *connect.Error.
+should return a *connect.Error. Returning a literal nil for both results
+is also reported, because Connect panics on it.
 
 The error is accepted if it is
-  - nil or a *connect.Error,
+  - a *connect.Error,
   - a *connect.Error wrapped with fmt.Errorf's %w verb,
-  - a local variable that is only ever assigned such errors, or
+  - a local variable that is only ever assigned such errors or nil, or
   - the result of a function, possibly in another package, that only
-    returns such errors.`
+    returns such errors or nil.`
 
 // Analyzer reports Connect handlers that return errors other than
 // *connect.Error.
@@ -117,18 +118,18 @@ func run(pass *analysis.Pass) (any, error) {
 			}
 
 			firstResult := returnStmt.Results[0]
-			secondResult := returnStmt.Results[1]
+			lastResult := returnStmt.Results[len(returnStmt.Results)-1]
 
-			firstIsNil := false
-			if ident, ok := firstResult.(*ast.Ident); ok && ident.Name == "nil" {
-				firstIsNil = true
-			}
-
-			if !firstIsNil {
+			if !isNil(pass, firstResult) {
 				return true
 			}
 
-			if c.isNilOrConnectError(secondResult) {
+			if isNil(pass, lastResult) {
+				pass.Reportf(returnStmt.Pos(), "should not return nil for both *connect.Response and error")
+				return true
+			}
+
+			if c.isConnectError(lastResult) {
 				return true
 			}
 
@@ -139,6 +140,11 @@ func run(pass *analysis.Pass) (any, error) {
 	}
 
 	return nil, nil
+}
+
+// isNil reports whether expr is the predeclared nil.
+func isNil(pass *analysis.Pass, expr ast.Expr) bool {
+	return pass.TypesInfo.Types[expr].IsNil()
 }
 
 // hasConnectResponseReturn reports whether fn has a Connect handler
@@ -324,11 +330,7 @@ func (c *checker) localVar(expr ast.Expr) *types.Var {
 }
 
 func (c *checker) isNilOrConnectError(expr ast.Expr) bool {
-	if ident, ok := expr.(*ast.Ident); ok && ident.Name == "nil" {
-		return true
-	}
-
-	return c.isConnectError(expr)
+	return isNil(c.pass, expr) || c.isConnectError(expr)
 }
 
 // isConnectError reports whether expr is a *connect.Error, an error that

@@ -31,10 +31,10 @@ Return a `*connect.Error` with a status code instead:
 
 A Connect handler is a function whose first result is `*connect.Response[T]` and whose last result is `error`. When a handler returns `nil` for the response, the error is accepted if it is
 
-- `nil` or a `*connect.Error`,
+- a `*connect.Error`,
 - a `*connect.Error` wrapped with `fmt.Errorf`'s `%w` verb, which Connect still finds with `errors.As`,
-- a local variable that is only ever assigned such errors, or
-- the result of a function that only returns such errors, even in another package:
+- a local variable that is only ever assigned such errors or `nil`, or
+- the result of a function that only returns such errors or `nil`, even in another package:
 
   ```go
   func toConnectErr(err error) error {
@@ -44,9 +44,12 @@ A Connect handler is a function whose first result is `*connect.Response[T]` and
   return nil, toConnectErr(err) // OK
   ```
 
+`return nil, nil` is also reported, because Connect panics when a handler returns nil for both results.
+
 ### Limitations
 
 - Only `return nil, err` is checked; returns with a non-nil response are not.
+- Only a literal `return nil, nil` is reported; an error that turns out to be nil at runtime is not.
 - Calls through interfaces or function values are not followed.
 - `fmt.Errorf` formats with explicit argument indexes, such as `%[1]w`, are not followed.
 
