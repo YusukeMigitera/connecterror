@@ -61,7 +61,12 @@ func run(pass *analysis.Pass) (any, error) {
 		(*ast.FuncDecl)(nil),
 	}
 
-	var handlers []*ast.FuncDecl
+	type handler struct {
+		decl *ast.FuncDecl
+		fn   *types.Func
+	}
+
+	var handlers []handler
 	helpers := map[*types.Func]*checker{}
 	connectFuncs := map[*types.Func]bool{}
 
@@ -78,7 +83,7 @@ func run(pass *analysis.Pass) (any, error) {
 
 		switch {
 		case hasConnectResponseReturn(fn):
-			handlers = append(handlers, funcDecl)
+			handlers = append(handlers, handler{funcDecl, fn})
 		case returnsError(fn):
 			helpers[fn] = newChecker(pass, funcDecl.Body, fn.Signature().Results(), connectFuncs)
 			connectFuncs[fn] = true
@@ -102,12 +107,12 @@ func run(pass *analysis.Pass) (any, error) {
 		pass.ExportObjectFact(fn, new(returnsConnectError))
 	}
 
-	for _, funcDecl := range handlers {
-		results := pass.TypesInfo.Defs[funcDecl.Name].(*types.Func).Signature().Results()
-		c := newChecker(pass, funcDecl.Body, results, connectFuncs)
+	for _, h := range handlers {
+		results := h.fn.Signature().Results()
+		c := newChecker(pass, h.decl.Body, results, connectFuncs)
 		last := results.Len() - 1
 
-		ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
+		ast.Inspect(h.decl.Body, func(n ast.Node) bool {
 			// Returns inside closures do not belong to the handler.
 			if _, ok := n.(*ast.FuncLit); ok {
 				return false
@@ -182,6 +187,8 @@ type checker struct {
 	// results holds the results the function declares. Named results are
 	// followed like local variables.
 	results *types.Tuple
+	// namedResults holds the named results, including blank ones.
+	namedResults map[*types.Var]bool
 
 	// connectFuncs holds the functions in this package that return Connect
 	// errors. Functions in other packages are looked up by their facts.
@@ -217,10 +224,17 @@ func newChecker(pass *analysis.Pass, body *ast.BlockStmt, results *types.Tuple, 
 		pass:         pass,
 		body:         body,
 		results:      results,
+		namedResults: map[*types.Var]bool{},
 		connectFuncs: connectFuncs,
 		assigns:      map[*types.Var][]ast.Expr{},
 		untracked:    map[*types.Var]bool{},
 		visiting:     map[*types.Var]bool{},
+	}
+
+	for i := range results.Len() {
+		if r := results.At(i); r.Name() != "" {
+			c.namedResults[r] = true
+		}
 	}
 
 	// Closures are included: they can assign to the handler's variables.
@@ -361,17 +375,12 @@ func (c *checker) localVar(expr ast.Expr) *types.Var {
 
 // isNamedResult reports whether v is a named result of the function.
 func (c *checker) isNamedResult(v *types.Var) bool {
-	for i := range c.results.Len() {
-		if r := c.results.At(i); r == v && r.Name() != "" {
-			return true
-		}
-	}
-	return false
+	return c.namedResults[v]
 }
 
-// isNil reports whether expr is the predeclared nil or a named result that
-// is always nil.
-func (c *checker) isNil(expr ast.Expr) bool {
+// isAlwaysNil reports whether expr is the predeclared nil or a named result
+// that is always nil. Unlike the isNil function, it follows named results.
+func (c *checker) isAlwaysNil(expr ast.Expr) bool {
 	if isNil(c.pass, expr) {
 		return true
 	}
@@ -399,7 +408,7 @@ func (c *checker) isNilVar(v *types.Var) bool {
 }
 
 func (c *checker) isNilOrConnectError(expr ast.Expr) bool {
-	return c.isNil(expr) || c.isConnectError(expr)
+	return c.isAlwaysNil(expr) || c.isConnectError(expr)
 }
 
 // isConnectError reports whether expr is a *connect.Error, an error that

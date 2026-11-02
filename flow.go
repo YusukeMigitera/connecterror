@@ -213,11 +213,11 @@ func (c *checker) resultAt(ret *ast.ReturnStmt, i int) (ast.Expr, *types.Var) {
 func (c *checker) returnsNil(ret *ast.ReturnStmt, i int) bool {
 	expr, v := c.resultAt(ret, i)
 	if v == nil {
-		return c.isNil(expr)
+		return c.isAlwaysNil(expr)
 	}
 
 	if value, ok := c.valueAt(v, ret); ok {
-		return value == nil || c.isNil(value)
+		return value == nil || c.isAlwaysNil(value)
 	}
 	return c.isNilVar(v)
 }
