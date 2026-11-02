@@ -33,7 +33,7 @@ A Connect handler is a function whose first result is `*connect.Response[T]` and
 
 - a `*connect.Error`,
 - a `*connect.Error` wrapped with `fmt.Errorf`'s `%w` verb, which Connect still finds with `errors.As`,
-- a local variable that is only ever assigned such errors or `nil`, or
+- a local variable or named result that is only ever assigned such errors or `nil`, or
 - the result of a function that only returns such errors or `nil`, even in another package:
 
   ```go
@@ -46,10 +46,24 @@ A Connect handler is a function whose first result is `*connect.Response[T]` and
 
 `return nil, nil` is also reported, because Connect panics when a handler returns nil for both results.
 
+Named results are followed like local variables, so a bare `return` is checked too. A named response that is only ever assigned `nil`, or never assigned, counts as `nil`:
+
+```go
+func (s *Server) GetUser(
+	ctx context.Context,
+	req *connect.Request[userv1.GetUserRequest],
+) (res *connect.Response[userv1.GetUserResponse], err error) {
+	if err = s.authorize(ctx); err != nil {
+		return // should return *connect.Error when returning nil for *connect.Response
+	}
+	// ...
+}
+```
+
 ### Limitations
 
 - Only `return nil, err` is checked; returns with a non-nil response are not.
-- Only a literal `return nil, nil` is reported; an error that turns out to be nil at runtime is not.
+- Only a literal `return nil, nil`, or named results that are always `nil`, are reported; an error that turns out to be nil at runtime is not.
 - Calls through interfaces or function values are not followed.
 - `fmt.Errorf` formats with explicit argument indexes, such as `%[1]w`, are not followed.
 
