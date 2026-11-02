@@ -24,8 +24,10 @@ is also reported, because Connect panics on it.
 The error is accepted if it is
   - a *connect.Error,
   - a *connect.Error wrapped with fmt.Errorf's %w verb,
-  - a local variable or named result that is only ever assigned such
-    errors or nil, or
+  - a local variable or named result whose last assignment before the
+    return is such an error, or that is only ever assigned such errors
+    or nil,
+  - a named result converted to such an error by a deferred closure, or
   - the result of a function, possibly in another package, that only
     returns such errors or nil.`
 
@@ -103,6 +105,7 @@ func run(pass *analysis.Pass) (any, error) {
 	for _, funcDecl := range handlers {
 		results := pass.TypesInfo.Defs[funcDecl.Name].(*types.Func).Signature().Results()
 		c := newChecker(pass, funcDecl.Body, results, connectFuncs)
+		last := results.Len() - 1
 
 		ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
 			// Returns inside closures do not belong to the handler.
@@ -115,34 +118,21 @@ func run(pass *analysis.Pass) (any, error) {
 				return true
 			}
 
-			var responseNil, errorNil, errorOK bool
-			switch len(returnStmt.Results) {
-			case 0:
-				// A bare return returns the named results.
-				errVar := results.At(results.Len() - 1)
-				responseNil = c.isNilVar(results.At(0))
-				errorNil = c.isNilVar(errVar)
-				errorOK = c.isConnectErrorVar(errVar)
-			case results.Len():
-				lastResult := returnStmt.Results[len(returnStmt.Results)-1]
-				responseNil = c.isNil(returnStmt.Results[0])
-				errorNil = c.isNil(lastResult)
-				errorOK = c.isConnectError(lastResult)
-			default:
-				// return f(), where f returns as many results
+			// return f(), where f returns as many results
+			if n := len(returnStmt.Results); n != 0 && n != results.Len() {
 				return true
 			}
 
-			if !responseNil {
+			if !c.returnsNil(returnStmt, 0) {
 				return true
 			}
 
-			if errorNil {
+			if c.returnsNil(returnStmt, last) {
 				pass.Reportf(returnStmt.Pos(), "should not return nil for both *connect.Response and error")
 				return true
 			}
 
-			if errorOK {
+			if c.returnsConnectErrorAt(returnStmt) {
 				return true
 			}
 
@@ -205,6 +195,21 @@ type checker struct {
 	untracked map[*types.Var]bool
 	// visiting guards against cycles like `e = fmt.Errorf("%w", e)`.
 	visiting map[*types.Var]bool
+
+	// The fields below let the checker follow the order of statements;
+	// see flow.go.
+
+	// parents maps each node in the body to its parent.
+	parents map[ast.Node]ast.Node
+	// closureAssigns holds the values assigned to each variable inside
+	// closures, which may run at any time.
+	closureAssigns map[*types.Var][]ast.Expr
+	// jumps reports whether the body contains goto or fallthrough, which
+	// enter a statement list other than at its start.
+	jumps bool
+	// conversion is the defer statement that converts the named error
+	// result to a Connect error, or nil.
+	conversion *ast.DeferStmt
 }
 
 func newChecker(pass *analysis.Pass, body *ast.BlockStmt, results *types.Tuple, connectFuncs map[*types.Func]bool) *checker {
@@ -269,6 +274,8 @@ func newChecker(pass *analysis.Pass, body *ast.BlockStmt, results *types.Tuple, 
 		return true
 	})
 
+	c.scanFlow()
+
 	return c
 }
 
@@ -313,12 +320,9 @@ func (c *checker) returnsOnlyConnectErrors() bool {
 		}
 
 		switch len(ret.Results) {
-		case numResults:
-			ok = c.isNilOrConnectError(ret.Results[numResults-1])
-		case 0:
+		case numResults, 0:
 			// A bare return returns the named results.
-			errVar := c.results.At(numResults - 1)
-			ok = c.isNilVar(errVar) || c.isConnectErrorVar(errVar)
+			ok = c.returnsNil(ret, numResults-1) || c.returnsConnectErrorAt(ret)
 		case 1:
 			// return f(), where f returns as many results
 			ok = c.isConnectError(ret.Results[0])
