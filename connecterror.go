@@ -576,7 +576,21 @@ func isConnectPointer(typ types.Type, name string) bool {
 		return false
 	}
 
-	pkgPath := obj.Pkg().Path()
-	return (strings.HasSuffix(pkgPath, "connectrpc.com/connect")) &&
-		obj.Name() == name
+	return isConnectPackage(obj.Pkg().Path()) && obj.Name() == name
+}
+
+// connectPath is the import path of the Connect package.
+const connectPath = "connectrpc.com/connect"
+
+// isConnectPackage reports whether pkgPath is the Connect package. A package
+// vendored in GOPATH mode, such as example.com/app/vendor/connectrpc.com/connect,
+// is matched by the path after the last vendor directory.
+func isConnectPackage(pkgPath string) bool {
+	if i := strings.LastIndex(pkgPath, "/vendor/"); i >= 0 {
+		pkgPath = pkgPath[i+len("/vendor/"):]
+	} else if rest, ok := strings.CutPrefix(pkgPath, "vendor/"); ok {
+		pkgPath = rest
+	}
+
+	return pkgPath == connectPath
 }
